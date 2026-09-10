@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: sevenicons-sync
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python order_sync_daemon.py
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
