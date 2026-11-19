@@ -609,5 +609,70 @@ def push_to_shopify(payment_data: dict) -> bool:
         logger.error(f"Failed to post order to Shopify: {e}")
         return False
 
+def sync_cycle():
+    synced = load_synced_orders()
+    headers = {
+        "Authorization": f"Bearer {WHOP_API_KEY}",
+        "Api-Version-Date": "2026-08-21-1",
+        "Accept": "application/json"
+    }
+    url = f"https://api.whop.com/api/v1/payments?company_id={WHOP_COMPANY_ID}&limit=20"
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            logger.warning(f"Whop API returned {resp.status_code}: {resp.text[:200]}")
+            return
+
+        payments = resp.json().get("data", [])
+        for p in payments:
+            pid = p.get("id")
+            status = p.get("status")
+
+            if status == "paid" and pid not in synced:
+                try:
+                    logger.info(f"Discovered NEW paid Whop payment: {pid}! Fetching details...")
+                    detail_resp = requests.get(f"https://api.whop.com/api/v1/payments/{pid}", headers=headers, timeout=10)
+                    if detail_resp.status_code == 200:
+                        detail_data = detail_resp.json()
+                        if push_to_shopify(detail_data):
+                            save_synced_order(pid)
+                    else:
+                        logger.warning(f"Could not fetch full details for {pid}, syncing with summary data...")
+                        if push_to_shopify(p):
+                            save_synced_order(pid)
+                except Exception as pe:
+                    logger.error(f"Failed to sync payment {pid}: {pe}")
+
+    except Exception as e:
+        logger.error(f"Error during sync cycle: {e}")
 
 
+def run_daemon(poll_interval=5):
+    logger.info(f"Starting Whop -> Shopify Real-Time Sync Daemon (Polling every {poll_interval}s)...")
+    logger.info(f"Target Store: {SHOPIFY_SHOP_DOMAIN}")
+    logger.info(f"Whop Company: {WHOP_COMPANY_ID}")
+
+    # Start lightweight HTTP health server for Render
+    threading.Thread(target=start_health_server, daemon=True).start()
+
+    while True:
+        try:
+            sync_cycle()
+        except KeyboardInterrupt:
+            logger.info("Stopping sync daemon.")
+            break
+        except Exception as e:
+            logger.error(f"Transient error in daemon loop: {e}. Retrying in {poll_interval}s...")
+        except BaseException as be:
+            if isinstance(be, (KeyboardInterrupt, SystemExit)):
+                break
+            logger.error(f"Critical error recovered: {be}")
+        time.sleep(poll_interval)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--once":
+        sync_cycle()
+    else:
+        run_daemon()
