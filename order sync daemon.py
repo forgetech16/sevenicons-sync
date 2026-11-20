@@ -476,12 +476,15 @@ def push_to_shopify(payment_data: dict) -> bool:
     tags_str = ", ".join(clean_tags[:10])
 
     # 4. If an existing dummy placeholder order was found, cancel it now
-    if existing_dummy_id:
+    def cancel_placeholder():
+        """Cancel the placeholder order - only called AFTER the real order was created."""
+        if not existing_dummy_id:
+            return
         try:
             logger.info(f"Cancelling placeholder Order {existing_dummy_id} in Shopify...")
             requests.post(
                 f"https://{SHOPIFY_SHOP_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/orders/{existing_dummy_id}/cancel.json",
-                json={"reason": "other", "email": False, "note": "Replaced by verified order with real product details."},
+                json={"reason": "other", "email": False},
                 headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"},
                 timeout=8
             )
@@ -534,9 +537,11 @@ def push_to_shopify(payment_data: dict) -> bool:
             }
         ]
     }
-    if phone:
-        shopify_payload["shipping_address"]["phone"] = phone
-        shopify_payload["customer"]["phone"] = phone
+    phone_clean = re.sub(r"[^0-9+]", "", str(phone or ""))
+    if phone_clean.startswith("00"):
+        phone_clean = "+" + phone_clean[2:]
+    if phone_clean and 8 <= len(phone_clean.lstrip("+")) <= 15 and isinstance(shopify_payload.get("shipping_address"), dict):
+        shopify_payload["shipping_address"]["phone"] = phone_clean
     if shipping_lines:
         shopify_payload["shipping_lines"] = shipping_lines
 
@@ -547,32 +552,37 @@ def push_to_shopify(payment_data: dict) -> bool:
         "Content-Type": "application/json"
     }
 
+    def strip_phone():
+        for key in ("customer", "shipping_address", "billing_address"):
+            if isinstance(shopify_payload.get(key), dict):
+                shopify_payload[key].pop("phone", None)
+
+    def strip_variants():
+        for li in shopify_payload.get("line_items", []):
+            li.pop("variant_id", None)
+
+    attempts = [("as is", None), ("without phone", strip_phone), ("without variant ids", strip_variants)]
     try:
-        resp = requests.post(endpoint, json={"order": shopify_payload}, headers=headers, timeout=15)
-        if resp.status_code in [200, 201]:
-            created_order = resp.json().get("order", {})
-            logger.info(f"[SUCCESS] Mirrored order to Shopify: Order #{created_order.get('name')} (ID: {created_order.get('id')}) with real line items: " + breakdown_text.replace('\n', ' '))
-            save_synced_order(payment_id)
-            return True
-        elif resp.status_code == 422:
-            logger.warning(f"Shopify 422: {resp.text}. Retrying with custom line items without variant_id...")
-            for li in shopify_payload.get("line_items", []):
-                li.pop("variant_id", None)
-            retry_resp = requests.post(endpoint, json={"order": shopify_payload}, headers=headers, timeout=15)
-            if retry_resp.status_code in [200, 201]:
-                created_order = retry_resp.json().get("order", {})
-                logger.info(f"[SUCCESS] Mirrored order to Shopify after 422 fix: Order #{created_order.get('name')}")
+        for label, fix in attempts:
+            if fix:
+                fix()
+            resp = requests.post(endpoint, json={"order": shopify_payload}, headers=headers, timeout=15)
+            if resp.status_code in [200, 201]:
+                created_order = resp.json().get("order", {})
+                logger.info(f"[SUCCESS] Mirrored order to Shopify ({label}): Order #{created_order.get('name')} (ID: {created_order.get('id')}) with real line items: " + breakdown_text.replace('\n', ' '))
                 save_synced_order(payment_id)
+                cancel_placeholder()
                 return True
-            else:
-                logger.error(f"Shopify Error on retry: {retry_resp.text}")
+            if resp.status_code != 422:
+                logger.error(f"Shopify API Error ({resp.status_code}): {resp.text[:300]}")
                 return False
-        else:
-            logger.error(f"Shopify API Error ({resp.status_code}): {resp.text}")
-            return False
+            logger.warning(f"Shopify 422 ({label}): {resp.text[:300]}")
+        logger.error(f"Shopify rejected order for {payment_id} after all retries.")
+        return False
     except Exception as e:
         logger.error(f"Failed to post order to Shopify: {e}")
         return False
+
 
 def sync_cycle():
     synced = load_synced_orders()
