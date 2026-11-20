@@ -110,6 +110,7 @@ def start_health_server():
 
 
 
+CATALOG_BY_PRICE = {}
 SYNC_DB_PATH = os.path.join(os.path.dirname(__file__), "synced_orders.json")
 
 
